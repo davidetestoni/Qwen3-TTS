@@ -1,4 +1,5 @@
 import argparse
+import io
 import logging
 import tempfile
 import threading
@@ -7,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import soundfile as sf
 import torch
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -23,11 +25,13 @@ logging.basicConfig(
 )
 
 CHECKPOINT = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+VOICE_DESIGN_CHECKPOINT = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
 DEVICE = "cuda:0"
 DTYPE = "bfloat16"
 FLASH_ATTN = False
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8000
+DEFAULT_MODE = "both"
 
 model_lock = threading.Lock()
 model: Qwen3TTSModel | None = None
@@ -35,6 +39,19 @@ model_kind: str | None = None
 model_checkpoint: str | None = None
 model_load_args: dict[str, Any] = {}
 generation_defaults: dict[str, Any] = {}
+voice_design_model: Qwen3TTSModel | None = None
+voice_design_checkpoint: str | None = None
+voice_design_load_args: dict[str, Any] = {}
+voice_design_generation_defaults: dict[str, Any] = {}
+server_mode: str = DEFAULT_MODE
+
+
+def _mode_supports_voice_clone() -> bool:
+    return server_mode in ("voice_clone", "both")
+
+
+def _mode_supports_voice_design() -> bool:
+    return server_mode in ("voice_design", "both")
 
 
 def _dtype_from_str(s: str) -> torch.dtype:
@@ -91,11 +108,32 @@ def _ensure_model() -> Qwen3TTSModel:
     return model
 
 
+def _ensure_voice_design_model() -> Qwen3TTSModel:
+    if not _mode_supports_voice_design():
+        raise HTTPException(status_code=503, detail="Voice design mode is disabled on this server.")
+    if model_kind == "voice_design":
+        return _ensure_model()
+    if voice_design_model is None:
+        raise RuntimeError(
+            "VoiceDesign model has not been initialized. Start the server with a voice design checkpoint enabled."
+        )
+    return voice_design_model
+
+
 def _wav_to_pcm16le_bytes(wav: np.ndarray) -> bytes:
     pcm = np.asarray(wav, dtype=np.float32)
     pcm = np.clip(pcm, -1.0, 1.0)
     pcm_i16 = (pcm * 32767.0).astype(np.int16)
     return pcm_i16.tobytes()
+
+
+def _wav_to_wav_bytes(wav: np.ndarray, sample_rate: int) -> bytes:
+    pcm = np.asarray(wav, dtype=np.float32)
+    pcm = np.clip(pcm, -1.0, 1.0)
+
+    buffer = io.BytesIO()
+    sf.write(buffer, pcm, sample_rate, format="WAV", subtype="PCM_16")
+    return buffer.getvalue()
 
 
 def _error_response(exc: Exception) -> HTTPException:
@@ -104,9 +142,7 @@ def _error_response(exc: Exception) -> HTTPException:
     return HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}")
 
 
-def _load_model(checkpoint: str, device: str, dtype: str, flash_attn: bool) -> None:
-    global model, model_kind, model_checkpoint, model_load_args, generation_defaults
-
+def _load_single_model(checkpoint: str, device: str, dtype: str, flash_attn: bool) -> tuple[Qwen3TTSModel, str, dict[str, Any], dict[str, Any]]:
     torch_dtype = _dtype_from_str(dtype)
     attn_implementation = "flash_attention_2" if flash_attn else None
 
@@ -116,16 +152,62 @@ def _load_model(checkpoint: str, device: str, dtype: str, flash_attn: bool) -> N
         dtype=torch_dtype,
         attn_implementation=attn_implementation,
     )
-
-    model = tts
-    model_kind = _detect_model_kind(tts)
-    model_checkpoint = checkpoint
-    model_load_args = {
+    load_args = {
         "device": device,
         "dtype": dtype,
         "flash_attn": flash_attn,
     }
-    generation_defaults = dict(getattr(tts, "generate_defaults", {}) or {})
+    defaults = dict(getattr(tts, "generate_defaults", {}) or {})
+    return tts, _detect_model_kind(tts), load_args, defaults
+
+
+def _load_model(checkpoint: str, voice_design_ckpt: str | None, mode: str, device: str, dtype: str, flash_attn: bool) -> None:
+    global model, model_kind, model_checkpoint, model_load_args, generation_defaults, server_mode
+    global voice_design_model, voice_design_checkpoint, voice_design_load_args, voice_design_generation_defaults
+
+    server_mode = mode
+
+    model = None
+    model_kind = None
+    model_checkpoint = None
+    model_load_args = {}
+    generation_defaults = {}
+    voice_design_model = None
+    voice_design_checkpoint = None
+    voice_design_load_args = {}
+    voice_design_generation_defaults = {}
+
+    primary_checkpoint = checkpoint
+    if mode == "voice_design":
+        primary_checkpoint = voice_design_ckpt or VOICE_DESIGN_CHECKPOINT
+
+    tts, detected_kind, load_args, defaults = _load_single_model(
+        checkpoint=primary_checkpoint,
+        device=device,
+        dtype=dtype,
+        flash_attn=flash_attn,
+    )
+    model = tts
+    model_kind = detected_kind
+    model_checkpoint = primary_checkpoint
+    model_load_args = load_args
+    generation_defaults = defaults
+
+    if mode == "both" and voice_design_ckpt and model_kind != "voice_design":
+        design_tts, design_kind, design_load_args, design_defaults = _load_single_model(
+            checkpoint=voice_design_ckpt,
+            device=device,
+            dtype=dtype,
+            flash_attn=flash_attn,
+        )
+        if design_kind != "voice_design":
+            raise ValueError(
+                f"Configured voice design checkpoint must load a voice_design model, got {design_kind}: {voice_design_ckpt}"
+            )
+        voice_design_model = design_tts
+        voice_design_checkpoint = voice_design_ckpt
+        voice_design_load_args = design_load_args
+        voice_design_generation_defaults = design_defaults
 
 
 @app.get("/health")
@@ -135,6 +217,10 @@ def health() -> JSONResponse:
             "status": "ok",
             "checkpoint": model_checkpoint,
             "model_kind": model_kind,
+            "mode": server_mode,
+            "voice_design_checkpoint": voice_design_checkpoint,
+            "voice_design_enabled": _mode_supports_voice_design() and (model_kind == "voice_design" or voice_design_model is not None),
+            "voice_clone_enabled": _mode_supports_voice_clone(),
         }
     )
 
@@ -154,10 +240,21 @@ def get_model_info() -> JSONResponse:
         {
             "checkpoint": model_checkpoint,
             "model_kind": model_kind,
+            "mode": server_mode,
             "load_args": model_load_args,
             "generation_defaults": generation_defaults,
             "supported_languages": supported_languages,
             "supported_speakers": supported_speakers,
+            "voice_design": {
+                "enabled": _mode_supports_voice_design() and (model_kind == "voice_design" or voice_design_model is not None),
+                "checkpoint": model_checkpoint if model_kind == "voice_design" else voice_design_checkpoint,
+                "load_args": model_load_args if model_kind == "voice_design" else voice_design_load_args,
+                "generation_defaults": generation_defaults if model_kind == "voice_design" else voice_design_generation_defaults,
+            },
+            "voice_clone": {
+                "enabled": _mode_supports_voice_clone(),
+                "checkpoint": model_checkpoint if model_kind != "voice_design" else None,
+            },
         }
     )
 
@@ -173,6 +270,7 @@ def tts(
     language: str = Form("Auto"),
     speaker: str | None = Form(default=None),
     instruct: str | None = Form(default=None),
+    ref_text: str | None = Form(default=None),
     reference_text: str | None = Form(default=None),
     reference_wav: UploadFile | None = File(default=None),
     max_new_tokens: int | None = Form(default=None),
@@ -191,6 +289,15 @@ def tts(
         raise HTTPException(status_code=400, detail="`text` must be non-empty.")
 
     normalized_language = _normalize_language(language)
+    normalized_instruct = (instruct or "").strip() or None
+    normalized_ref_text = (ref_text or reference_text or "").strip() or None
+    x_vector_only_mode = normalized_ref_text is None
+    if reference_wav is not None and normalized_instruct is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide either `reference_wav` for voice cloning or `instruct` for voice design, not both.",
+        )
+
     gen_kwargs = _collect_gen_kwargs(
         max_new_tokens=max_new_tokens,
         temperature=temperature,
@@ -209,13 +316,24 @@ def tts(
         len(text),
         normalized_language,
         (speaker or "").strip() or None,
-        bool((instruct or "").strip()),
+        bool(normalized_instruct),
         reference_wav is not None,
-        bool((reference_text or "").strip()),
-        True,
+        bool(normalized_ref_text),
+        x_vector_only_mode,
     )
     try:
-        if model_kind == "custom_voice":
+        if normalized_instruct is not None:
+            design_model = _ensure_voice_design_model()
+            with model_lock:
+                wavs, sr = design_model.generate_voice_design(
+                    text=text,
+                    language=normalized_language,
+                    instruct=normalized_instruct,
+                    **gen_kwargs,
+                )
+        elif model_kind == "custom_voice":
+            if not _mode_supports_voice_clone():
+                raise HTTPException(status_code=503, detail="Voice clone mode is disabled on this server.")
             normalized_speaker = (speaker or "").strip()
             if not normalized_speaker:
                 raise HTTPException(status_code=400, detail="`speaker` is required for custom_voice models.")
@@ -224,23 +342,17 @@ def tts(
                     text=text,
                     language=normalized_language,
                     speaker=normalized_speaker,
-                    instruct=(instruct or "").strip() or None,
-                    **gen_kwargs,
-                )
-        elif model_kind == "voice_design":
-            normalized_instruct = (instruct or "").strip()
-            if not normalized_instruct:
-                raise HTTPException(status_code=400, detail="`instruct` is required for voice_design models.")
-            with model_lock:
-                wavs, sr = tts_model.generate_voice_design(
-                    text=text,
-                    language=normalized_language,
-                    instruct=normalized_instruct,
+                    instruct=None,
                     **gen_kwargs,
                 )
         elif model_kind == "base":
+            if not _mode_supports_voice_clone():
+                raise HTTPException(status_code=503, detail="Voice clone mode is disabled on this server.")
             if reference_wav is None:
-                raise HTTPException(status_code=400, detail="`reference_wav` is required for base models.")
+                raise HTTPException(
+                    status_code=400,
+                    detail="Provide `reference_wav` for voice cloning or `instruct` for voice design.",
+                )
             uploaded = reference_wav.file.read()
             if not uploaded:
                 raise HTTPException(status_code=400, detail="`reference_wav` was provided but is empty.")
@@ -256,8 +368,8 @@ def tts(
                     text=text,
                     language=normalized_language,
                     ref_audio=tmp_reference_path,
-                    ref_text=None,
-                    x_vector_only_mode=True,
+                    ref_text=normalized_ref_text,
+                    x_vector_only_mode=x_vector_only_mode,
                     **gen_kwargs,
                 )
         else:
@@ -284,6 +396,74 @@ def tts(
         },
     )
 
+
+@app.post("/voice-design")
+def voice_design(
+    prompt: str = Form(...),
+    voice_description: str = Form(...),
+    language: str | None = Form(default=None),
+    max_new_tokens: int | None = Form(default=None),
+    temperature: float | None = Form(default=None),
+    top_k: int | None = Form(default=None),
+    top_p: float | None = Form(default=None),
+    repetition_penalty: float | None = Form(default=None),
+    subtalker_top_k: int | None = Form(default=None),
+    subtalker_top_p: float | None = Form(default=None),
+    subtalker_temperature: float | None = Form(default=None),
+) -> Response:
+    design_model = _ensure_voice_design_model()
+
+    normalized_prompt = prompt.strip()
+    if not normalized_prompt:
+        raise HTTPException(status_code=400, detail="`prompt` must be non-empty.")
+
+    normalized_voice_description = voice_description.strip()
+    if not normalized_voice_description:
+        raise HTTPException(status_code=400, detail="`voice_description` must be non-empty.")
+
+    normalized_language = _normalize_language(language)
+    gen_kwargs = _collect_gen_kwargs(
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
+        repetition_penalty=repetition_penalty,
+        subtalker_top_k=subtalker_top_k,
+        subtalker_top_p=subtalker_top_p,
+        subtalker_temperature=subtalker_temperature,
+    )
+
+    logger.info(
+        "Received /voice-design request prompt_length=%s language=%s voice_description=%s",
+        len(normalized_prompt),
+        normalized_language,
+        normalized_voice_description,
+    )
+    try:
+        with model_lock:
+            wavs, sr = design_model.generate_voice_design(
+                text=normalized_prompt,
+                language=normalized_language,
+                instruct=normalized_voice_description,
+                **gen_kwargs,
+            )
+    except Exception as exc:
+        logger.exception("Voice design generation failed")
+        raise _error_response(exc) from exc
+
+    wav_bytes = _wav_to_wav_bytes(wavs[0], sr)
+    return Response(
+        content=wav_bytes,
+        media_type="audio/wav",
+        headers={
+            "X-Audio-Format": "wav_pcm_s16le",
+            "X-Sample-Rate": str(sr),
+            "X-Channels": "1",
+            "X-Model-Kind": "voice_design",
+        },
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python server.py",
@@ -291,6 +471,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--host", default=DEFAULT_HOST, help="Server bind host.")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Server port.")
+    parser.add_argument(
+        "--mode",
+        choices=("voice_clone", "voice_design", "both"),
+        default=DEFAULT_MODE,
+        help="Load only voice clone, only voice design, or both models.",
+    )
+    parser.add_argument("--checkpoint", default=CHECKPOINT, help="Primary model checkpoint path or Hugging Face repo id.")
+    parser.add_argument(
+        "--voice-design-checkpoint",
+        default=VOICE_DESIGN_CHECKPOINT,
+        help="VoiceDesign model checkpoint path or Hugging Face repo id. Set empty to disable voice design routing.",
+    )
+    parser.add_argument("--device", default=DEVICE, help="Inference device.")
+    parser.add_argument("--dtype", default=DTYPE, help="Torch dtype: bfloat16, float16, or float32.")
+    parser.add_argument("--flash-attn", action="store_true", default=FLASH_ATTN, help="Enable flash_attention_2.")
     return parser
 
 
@@ -299,10 +494,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     _load_model(
-        checkpoint=CHECKPOINT,
-        device=DEVICE,
-        dtype=DTYPE,
-        flash_attn=FLASH_ATTN,
+        checkpoint=args.checkpoint,
+        voice_design_ckpt=(args.voice_design_checkpoint or "").strip() or None,
+        mode=args.mode,
+        device=args.device,
+        dtype=args.dtype,
+        flash_attn=args.flash_attn,
     )
 
     uvicorn.run(app, host=args.host, port=args.port, reload=False)
